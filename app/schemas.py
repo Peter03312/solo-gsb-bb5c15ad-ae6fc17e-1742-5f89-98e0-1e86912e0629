@@ -143,3 +143,16 @@ class ReplanIn(BaseModel):
     @classmethod
     def norm_codes(cls, v):
         return sorted({_norm_code(x) for x in v if x.strip()})
+
+
+class CapacityIn(BaseModel):
+    """按课程代码与学期设置非负席位上限；未设置的课程+学期视为不限额。"""
+
+    course: str = Field(min_length=1, max_length=32, description="课程代码（须在当前目录版本中）")
+    semester: str = Field(description="学期，如 2027-SPRING")
+    seat_limit: int = Field(ge=0, description="非负席位上限")
+
+    @field_validator("course")
+    @classmethod
+    def norm_course(cls, v):
+        return _norm_code(v)

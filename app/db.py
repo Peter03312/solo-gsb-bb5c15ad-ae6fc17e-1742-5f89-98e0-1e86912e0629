@@ -1,4 +1,4 @@
-"""SQLite 持久化：目录版本与规划方案。"""
+"""SQLite 持久化：目录版本、规划方案与课程席位容量。"""
 from __future__ import annotations
 
 import json
@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS equiv_groups (
     code TEXT NOT NULL,                       -- 组内课程代码
     PRIMARY KEY (version_id, code)            -- 一门课程在同一版本内至多归入一组
 );
+CREATE TABLE IF NOT EXISTS capacities (
+    course_code TEXT NOT NULL,                -- 课程代码（须存在于当前目录版本）
+    semester TEXT NOT NULL,                   -- 学期标签：YYYY-SPRING / YYYY-FALL
+    seat_limit INTEGER NOT NULL CHECK (seat_limit >= 0),  -- 非负席位上限；无记录表示不限额
+    PRIMARY KEY (course_code, semester)
+);
+CREATE TABLE IF NOT EXISTS seat_reservations (
+    plan_id TEXT NOT NULL REFERENCES plans(id),  -- 仅已确认方案/草案产生占位
+    course_code TEXT NOT NULL,                   -- 实际修读课程（互认替代按实际课程占位）
+    semester TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (plan_id, course_code, semester)
+);
 """
 
 # 既有数据库增量升级（SQLite 不支持 CREATE TABLE IF NOT EXISTS 加列）
@@ -57,6 +70,8 @@ def db_path():
 def connect():
     conn = sqlite3.connect(db_path())
     conn.row_factory = sqlite3.Row
+    # 写事务等待锁而非立即报“database is locked”，配合确认路径的 BEGIN IMMEDIATE
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -181,3 +196,71 @@ def list_plans(conn):
 
 def set_plan_status(conn, plan_id, status):
     conn.execute("UPDATE plans SET status=? WHERE id=?", (status, plan_id))
+
+
+# ---------------------------------------------------------------- 席位容量与占位
+
+def set_capacity(conn, course_code, semester, seat_limit):
+    """设置（或更新）某课程在某学期的非负席位上限。"""
+    conn.execute(
+        "INSERT INTO capacities (course_code, semester, seat_limit) VALUES (?,?,?)"
+        " ON CONFLICT (course_code, semester) DO UPDATE SET seat_limit=excluded.seat_limit",
+        (course_code, semester, seat_limit),
+    )
+
+
+def delete_capacity(conn, course_code, semester):
+    """删除限额设置（恢复不限额）；返回是否有记录被删除。"""
+    cur = conn.execute(
+        "DELETE FROM capacities WHERE course_code=? AND semester=?", (course_code, semester))
+    return cur.rowcount > 0
+
+
+def list_capacities(conn):
+    """全部已设置的限额，按课程代码、学期排序。"""
+    return conn.execute(
+        "SELECT course_code, semester, seat_limit FROM capacities"
+        " ORDER BY course_code, semester").fetchall()
+
+
+def get_occupancy(conn):
+    """当前已确认占位统计：{(课程代码, 学期): 已占用席位数}。"""
+    rows = conn.execute(
+        "SELECT course_code, semester, COUNT(*) AS n FROM seat_reservations"
+        " GROUP BY course_code, semester").fetchall()
+    return {(r["course_code"], r["semester"]): r["n"] for r in rows}
+
+
+def add_reservations(conn, plan_id, items):
+    """为已确认方案/草案写入占位；items 为 (课程代码, 学期) 列表。"""
+    conn.executemany(
+        "INSERT INTO seat_reservations (plan_id, course_code, semester, created_at)"
+        " VALUES (?,?,?,?)",
+        [(plan_id, c, s, _now()) for c, s in items],
+    )
+
+
+def get_reservations(conn, plan_id):
+    """某方案当前的全部占位，返回 (课程代码, 学期) 列表。"""
+    rows = conn.execute(
+        "SELECT course_code, semester FROM seat_reservations WHERE plan_id=?",
+        (plan_id,)).fetchall()
+    return [(r["course_code"], r["semester"]) for r in rows]
+
+
+def delete_reservations(conn, plan_id, semesters):
+    """删除某方案在指定学期集合内的占位（重排草案确认时释放来源方案未结束学期的占位）。"""
+    if not semesters:
+        return
+    conn.executemany(
+        "DELETE FROM seat_reservations WHERE plan_id=? AND semester=?",
+        [(plan_id, s) for s in semesters],
+    )
+
+
+def confirmed_replan_of(conn, source_plan_id, exclude_id=None):
+    """来源方案已生效（已确认）的重排草案；不存在返回 None。"""
+    row = conn.execute(
+        "SELECT id FROM plans WHERE source_plan_id=? AND status='confirmed' AND id!=?",
+        (source_plan_id, exclude_id or "")).fetchone()
+    return row["id"] if row else None

@@ -249,3 +249,106 @@ curl -s "$BASE/catalog/current" | python3 -c "import sys,json;d=json.load(sys.st
 
 step "35. 回看：历史目录版本保持原语义（版本 1 无互认组）"
 curl -s "$BASE/catalog/versions/1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version_id'], d['equivalence_groups'])"
+
+step "36. 席位容量：设置 CS401 在 2026-FALL 上限 1 席，并查询（上限/已占用/余量）"
+curl -s -X PUT "$BASE/capacity" -H 'Content-Type: application/json' -d '{
+  "course": "CS401", "semester": "2026-FALL", "seat_limit": 1
+}'; echo
+curl -s "$BASE/capacity"; echo
+curl -s "$BASE/capacity?course=CS401&semester=2026-FALL"; echo
+echo "未设置限额的组合（不限额，上限与余量为 null）："
+curl -s "$BASE/capacity?course=CS101&semester=2026-SPRING"; echo
+
+step "37. 待确认方案不占位：规划方案 E、F（均需 CS401@2026-FALL），余量不变"
+PLAN_E=$(curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301"],
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 4
+}')
+echo "$PLAN_E"
+PLAN_E_ID=$(echo "$PLAN_E" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+PLAN_F=$(curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301"],
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 4
+}')
+PLAN_F_ID=$(echo "$PLAN_F" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s "$BASE/capacity?course=CS401&semester=2026-FALL"; echo
+
+step "38. 确认方案 E：原子复核席位并占位（occupied=1, remaining=0）"
+curl -s -X POST "$BASE/plans/$PLAN_E_ID/confirm"; echo
+curl -s "$BASE/capacity?course=CS401&semester=2026-FALL"; echo
+
+step "39. 确认方案 F：余量已变 -> 409 CAPACITY_FULL，不超卖，F 保持 proposed"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$PLAN_F_ID/confirm"
+echo "方案 F 状态与席位（仍 proposed、占用不变）："
+curl -s "$BASE/plans/$PLAN_F_ID" | python3 -c "import sys,json;print(json.load(sys.stdin)['status'])"
+curl -s "$BASE/capacity?course=CS401&semester=2026-FALL"; echo
+
+step "40. 错误示例：上限低于已占用席位（409 CAPACITY_BELOW_OCCUPIED，不写入）"
+curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/capacity" -H 'Content-Type: application/json' -d '{
+  "course": "CS401", "semester": "2026-FALL", "seat_limit": 0
+}'
+
+step "41. 重排草案确认：来源方案未结束学期的占位被新课表置换（此处新课表为空 -> 释放）"
+REPLAN_G=$(curl -s -X POST "$BASE/plans/$PLAN_E_ID/replan" -H 'Content-Type: application/json' -d '{
+  "elapsed_semesters": 1,
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301", "CS401"]
+}')
+echo "$REPLAN_G"
+DRAFT_G_ID=$(echo "$REPLAN_G" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -X POST "$BASE/plans/$DRAFT_G_ID/confirm"; echo
+echo "CS401@2026-FALL 占位已释放（occupied=0, remaining=1）："
+curl -s "$BASE/capacity?course=CS401&semester=2026-FALL"; echo
+
+step "42. 错误示例：同一来源只能有一个生效的重排结果，过期草案 409 REPLAN_EXPIRED"
+REPLAN_H=$(curl -s -X POST "$BASE/plans/$PLAN_E_ID/replan" -H 'Content-Type: application/json' -d '{
+  "elapsed_semesters": 1,
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301", "CS401"]
+}')
+DRAFT_H_ID=$(echo "$REPLAN_H" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$DRAFT_H_ID/confirm"
+
+step "43. 互认按实际修读课程占位：目标 CS401 实际择修同组 CS402，占 CS402 的名额"
+PLAN_I=$(curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH101", "MATH102", "MATH103", "CS301"],
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6
+}')
+echo "$PLAN_I"
+PLAN_I_ID=$(echo "$PLAN_I" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -X POST "$BASE/plans/$PLAN_I_ID/confirm" > /dev/null
+echo "CS402@2026-SPRING（实际修读，occupied=1）与 CS401@2026-SPRING（原课，occupied=0）："
+curl -s "$BASE/capacity?course=CS402&semester=2026-SPRING"; echo
+curl -s "$BASE/capacity?course=CS401&semester=2026-SPRING"; echo
+
+step "44. 容量不足使规划无解：PHYS201 及其同修课 PHYS201L 各春季学期上限 0 -> 422 NO_SOLUTION，不保存方案"
+for SEM in 2026-SPRING 2027-SPRING 2028-SPRING; do
+  curl -s -X PUT "$BASE/capacity" -H 'Content-Type: application/json' \
+    -d "{\"course\": \"PHYS201\", \"semester\": \"$SEM\", \"seat_limit\": 0}" > /dev/null
+  curl -s -X PUT "$BASE/capacity" -H 'Content-Type: application/json' \
+    -d "{\"course\": \"PHYS201L\", \"semester\": \"$SEM\", \"seat_limit\": 0}" > /dev/null
+done
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "target_courses": ["PHYS201"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6
+}'
+
+step "45. 错误示例：未知课程 / 非法学期 / 负上限（均拒绝且不写入）"
+curl -s -X PUT "$BASE/capacity" -H 'Content-Type: application/json' -d '{
+  "course": "ABC123", "semester": "2027-SPRING", "seat_limit": 10
+}'; echo
+curl -s -X PUT "$BASE/capacity" -H 'Content-Type: application/json' -d '{
+  "course": "CS301", "semester": "2027春", "seat_limit": 10
+}'; echo
+curl -s -X PUT "$BASE/capacity" -H 'Content-Type: application/json' -d '{
+  "course": "CS301", "semester": "2027-SPRING", "seat_limit": -1
+}'; echo
+
+step "46. 删除限额设置，恢复不限额"
+for SEM in 2026-SPRING 2027-SPRING 2028-SPRING; do
+  curl -s -X DELETE "$BASE/capacity/PHYS201/$SEM" > /dev/null
+  curl -s -X DELETE "$BASE/capacity/PHYS201L/$SEM" > /dev/null
+done
+curl -s -X DELETE "$BASE/capacity/CS401/2026-FALL"; echo
+curl -s "$BASE/capacity"; echo

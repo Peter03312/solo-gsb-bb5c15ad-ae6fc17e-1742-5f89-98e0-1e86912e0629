@@ -16,6 +16,9 @@
   一次修读即可满足。未声明互认组时沿用既有行为。
 - 目标：在规划期限（num_semesters）内最早完成；完成学期相同者，按“各学期课程
   代码序列”（每学期内代码升序、再按学期先后组成元组）的字典序取最小者。
+- 可选课程席位容量（seats）：{(课程代码, 学期标签): 剩余席位}，仅列出的组合受限，
+  未列出的视为不限额。课程只能排在余量 ≥ 1 的学期；因席位不足导致期限内无解时，
+  以 NO_SOLUTION 说明（不返回部分课表）。
 """
 from __future__ import annotations
 
@@ -295,14 +298,19 @@ def _fixed_assignments(blocks, lock_items, start_season):
 # ---------------------------------------------------------------- 排课搜索
 
 def _schedule(blocks, reqs, num_semesters, start_season, cap,
-              fixed=None, unavailable=frozenset()):
+              fixed=None, unavailable=frozenset(), seat_ok=None):
     """返回 (k, seq)：最少 k 个学期排完时字典序最小的方案；期限内无解返回 None。
 
     seq 为每学期课程代码（升序）组成的元组的元组，长度 k。
     fixed: {块编号: 学期序号}，锁定块必须且只能安排在该学期；
-    unavailable: 不可排课学期序号集合，这些学期不安排任何课程。
+    unavailable: 不可排课学期序号集合，这些学期不安排任何课程；
+    seat_ok: 可选回调 seat_ok(块编号, 学期序号) -> bool，该学期席位有余量时为真。
     """
     fixed = fixed or {}
+
+    def has_seat(b, i):
+        return seat_ok is None or seat_ok(b, i)
+
     n = len(blocks)
     assign = [-1] * n
     counter = [0]
@@ -320,9 +328,10 @@ def _schedule(blocks, reqs, num_semesters, start_season, cap,
             f = fixed.get(b)
             if f is not None and f < i:
                 return False
-        # 剪枝：每个剩余块在 i..k 内至少有一个匹配季节的学期
+        # 剪枝：每个剩余块在 i..k 内至少有一个匹配季节且席位有余量的学期
         for b in remaining:
-            if not any(season_at(start_season, j) in blocks[b].seasons for j in range(i, k + 1)):
+            if not any(season_at(start_season, j) in blocks[b].seasons and has_seat(b, j)
+                       for j in range(i, k + 1)):
                 return False
         # 剪枝：单季节块的学分不能超过剩余该季节学期的总容量
         for s in SEASONS:
@@ -339,6 +348,7 @@ def _schedule(blocks, reqs, num_semesters, start_season, cap,
             b for b in remaining
             if season_at(start_season, i) in blocks[b].seasons
             and fixed.get(b) in (None, i)  # 锁定块只能在其锁定学期安排
+            and has_seat(b, i)             # 席位余量不足的学期不可安排
             and all(any(0 < assign[o] < i for o in opts) for opts in reqs[b])
         ]
         if not must <= frozenset(avail):
@@ -394,7 +404,7 @@ def _deadlocked_codes(blocks, reqs):
 # ---------------------------------------------------------------- 主入口
 
 def build_plan(catalog, completed, targets, start_semester, max_credits, num_semesters,
-               locked=None, unavailable=None, equiv_groups=None):
+               locked=None, unavailable=None, equiv_groups=None, seats=None):
     """生成完整方案；失败抛出 PlanError（不返回部分课表）。
 
     catalog:     {code: Course}
@@ -405,6 +415,8 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
     unavailable: 可选不可排课学期标签列表，这些学期不安排任何课程
     equiv_groups: 可选课程互认组（随目录版本声明）；组内课程可替代满足目标课程
                  与先修组选项，已修同组课程视为已满足；不豁免同修与锁定
+    seats:       可选席位余量 {(课程代码, 学期标签): 剩余席位}；仅列出的组合受限，
+                 未列出的不限额；课程只能排在余量 ≥ 1 的学期
     """
     start_year, start_season = parse_semester(start_semester)
     targets = list(dict.fromkeys(t.strip().upper() for t in targets))
@@ -474,6 +486,12 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
     best = None
     no_solution_notes = []
 
+    # 席位余量：课程只能排在余量 ≥ 1 的学期；seats 为 None 时不约束（沿用既有行为）
+    seat_labels = None
+    if seats is not None:
+        seat_labels = [semester_label(start_year, start_season, i)
+                       for i in range(1, num_semesters + 1)]
+
     for courses in leaves:
         try:
             blocks = _build_blocks(catalog, courses)
@@ -495,9 +513,29 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
                 f"同修课程 {'+'.join(heavy.codes)} 学分合计 {heavy.credits} "
                 f"超过每学期学分上限 {max_credits}")
             continue
+        seat_ok = None
+        if seats is not None:
+            members_of = [b.members for b in blocks]
+
+            def seat_ok(b, i, _members=members_of, _labels=seat_labels, _seats=seats):
+                label = _labels[i - 1]
+                return all(_seats.get((c, label), 1) >= 1 for c in _members[b])
+
         sched = _schedule(blocks, reqs, num_semesters, start_season, max_credits,
-                          fixed=fixed, unavailable=unavailable_idx)
+                          fixed=fixed, unavailable=unavailable_idx, seat_ok=seat_ok)
         if sched is None:
+            if seat_ok is not None:
+                # 放宽席位再试一次：可行则说明是席位余量不足导致期限内无解
+                free = _schedule(blocks, reqs, num_semesters, start_season, max_credits,
+                                 fixed=fixed, unavailable=unavailable_idx)
+                if free is not None:
+                    limited = sorted({c for b in blocks for c in b.members
+                                      if any((c, label) in seats for label in seat_labels)})
+                    note = f"受课程席位余量限制，{num_semesters} 个学期内无法排完所需课程"
+                    if limited:
+                        note += f"（涉及限额课程：{'、'.join(limited)}）"
+                    no_solution_notes.append(note)
+                    continue
             # 放宽学期数与学分上限再试一次（锁定与不可排课约束保留），
             # 用于区分“条件冲突”与“期限内无解”
             relaxed = _schedule(blocks, reqs, max(num_semesters, 2 * len(blocks) + 2),
@@ -518,6 +556,8 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
                 if unavailable_idx:
                     factors.append("不可排课学期")
                 factors += ["开课学期", "先修顺序"]
+                if seat_ok is not None:
+                    factors.append("课程席位余量")
                 no_solution_notes.append(
                     f"受{'、'.join(factors)}或每学期学分上限 {max_credits} 限制，"
                     f"{num_semesters} 个学期内无法排完所需课程")

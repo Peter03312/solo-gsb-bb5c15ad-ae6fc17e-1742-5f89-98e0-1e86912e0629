@@ -27,6 +27,10 @@
     或期限内无解时，返回具体原因，**不返回部分课表**。
 - **目录版本**：每次目录修订生成新版本；方案创建时绑定当前版本，可随时回看；
   确认方案时若目录已修订，则拒绝（409）且不写入。
+- **课程席位容量**：可按“课程代码 + 学期”设置**非负席位上限**（未设置表示不限额），
+  查询返回上限、已占用与余量。规划与滚动重排基于**当时余量**排课；**待确认方案不占位**；
+  确认时原子复核目录版本与每门课席位并占位，余量不足则拒绝确认、保留原方案与原占位，
+  不超卖。详见下文「课程席位容量」。
 - **执行中途滚动重排（草案）**：已确认方案执行过程中，如实际完成情况与计划不同或目录已修订，
   可凭**原方案编号、已结束学期数、截至该时点的累计已修课程**重新排课：
   - 已结束学期数必须 **大于 0 且小于原规划期限**；累计已修**不得撤销**原方案创建时声明的已修
@@ -81,10 +85,13 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | POST | `/catalog/versions` | 目录修订：全量提交课程集合（可选互认组），生成新版本 |
 | GET | `/catalog/current` | 当前目录版本及全部课程（含互认组） |
 | GET | `/catalog/versions/{id}` | 查看历史目录版本（供回看） |
-| POST | `/plans` | 生成规划方案（绑定当前目录版本；可选锁定安排与不可排课学期） |
+| PUT | `/capacity` | 设置某课程某学期的非负席位上限（未设置表示不限额） |
+| GET | `/capacity` | 查询席位：上限、已占用与余量；可按 course/semester 过滤 |
+| DELETE | `/capacity/{course}/{semester}` | 删除限额设置，恢复不限额 |
+| POST | `/plans` | 生成规划方案（绑定当前目录版本；可选锁定安排与不可排课学期；按当时余量排课） |
 | GET | `/plans` | 方案列表 |
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
-| POST | `/plans/{id}/confirm` | 确认方案/草案；目录已修订则 409 拒绝且不写入 |
+| POST | `/plans/{id}/confirm` | 确认方案/草案；原子复核目录版本与席位并占位，冲突则 409 拒绝且不写入 |
 | POST | `/plans/{id}/replan` | 已确认方案执行中途滚动重排，生成关联草案（201） |
 
 ### 目录课程字段
@@ -372,6 +379,64 @@ curl -X POST http://localhost:8000/plans/<plan_id>/replan \
 - 确认草案沿用原约定：`POST /plans/<draft_id>/confirm`；`GET /plans` 列表中草案带
   `source_plan_id` 字段。确认草案不影响原方案。
 
+### 课程席位容量
+
+按“课程代码 + 学期”设置**非负席位上限**；**未设置的课程+学期不限额**。容量为全局设置，
+不随目录版本变化，但课程设置时课程须存在于**当前目录版本**。
+
+- **设置**：`PUT /capacity`，请求体 `{"course": "CS301", "semester": "2027-SPRING", "seat_limit": 30}`。
+  未知当前目录课程（422 `COURSE_MISSING`）、非法学期（400 `INVALID_INPUT`）、
+  负上限（422 `INVALID_INPUT`）或上限低于该组合**已占用席位**
+  （409 `CAPACITY_BELOW_OCCUPIED`）时拒绝且不写入。
+- **查询**：`GET /capacity` 返回全部已设置项；`?course=CS301&semester=2027-SPRING`
+  查询单个组合（未设置时 `seat_limit`/`remaining` 为 `null`，表示不限额）。
+  每项返回**上限、已占用与余量**。`DELETE /capacity/{course}/{semester}` 删除设置，恢复不限额。
+- **占位规则**：
+  - 仅**已确认**方案/草案产生占位（每门实际修读课程占 1 席）；**待确认方案不占位**。
+  - 规划与滚动重排基于**当时余量**寻找仍满足先修、同修、互认、锁定及最早完成与
+    字典序规则的课表；重排时来源方案**尚未结束学期**的既有占位视为可用（确认草案时将被置换）。
+  - **确认**时原子复核目录版本与每门课席位并占位：余量变化导致冲突时拒绝确认
+    （409 `CAPACITY_FULL`），**保留原方案与原占位，不出现超卖**；重复确认幂等。
+  - **确认重排草案**时，仅将来源方案**尚未结束学期**的占位替换为新课表占位，
+    **已结束学期的占位保留**；同一来源只能有一个生效的重排结果，
+    其余草案过期（409 `REPLAN_EXPIRED`）。
+  - **互认按实际修读课程占位**：目标 CS401 实际择修同组 CS402 时，占用 CS402 的名额，
+    不计入 CS401。
+  - 容量不足使规划无解时返回 422 `NO_SOLUTION` 并说明涉及限额的课程，**不保存部分方案**。
+
+```bash
+# 设置限额：CS301 在 2027-SPRING 仅 1 席
+curl -X PUT http://localhost:8000/capacity -H 'Content-Type: application/json' -d '{
+  "course": "CS301", "semester": "2027-SPRING", "seat_limit": 1
+}'
+# -> {"course": "CS301", "semester": "2027-SPRING", "seat_limit": 1, "occupied": 0, "remaining": 1}
+
+# 查询：全部已设置项 / 单个组合（未设置的组合 seat_limit 与 remaining 为 null）
+curl http://localhost:8000/capacity
+curl 'http://localhost:8000/capacity?course=CS301&semester=2027-SPRING'
+
+# 规划按当时余量排课；待确认方案不占位（occupied 仍为 0）
+curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d '{
+  "target_courses": ["CS401"], "start_semester": "2026-SPRING",
+  "max_credits_per_semester": 12, "num_semesters": 6
+}'
+
+# 确认后占位生效：occupied=1, remaining=0
+curl -X POST http://localhost:8000/plans/<plan_id>/confirm
+curl 'http://localhost:8000/capacity?course=CS301&semester=2027-SPRING'
+
+# 另一方案在确认前已按余量 1 规划同一席位，确认时余量已变 -> 409 CAPACITY_FULL，不超卖
+# {"detail": {"code": "CAPACITY_FULL", "message": "课程 CS301 在 2027-SPRING 的席位不足（上限 1，已占用 1）..."}}
+
+# 上限低于已占用席位时拒绝设置 -> 409 CAPACITY_BELOW_OCCUPIED
+curl -X PUT http://localhost:8000/capacity -H 'Content-Type: application/json' -d '{
+  "course": "CS301", "semester": "2027-SPRING", "seat_limit": 0
+}'
+
+# 删除限额，恢复不限额
+curl -X DELETE http://localhost:8000/capacity/CS301/2027-SPRING
+```
+
 ### 错误响应
 
 失败时返回相应 HTTP 状态码与原因，不返回部分课表：
@@ -382,27 +447,30 @@ curl -X POST http://localhost:8000/plans/<plan_id>/replan \
 
 | code | HTTP | 含义 |
 | --- | --- | --- |
-| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、重复锁定、锁定已修课、锁定学期超出规划期限、互认组含不存在课程/重复归组/少于两门等 |
-| `COURSE_MISSING` | 422 | 课程缺失：目标或锁定课程不在当前目录版本中 |
+| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、重复锁定、锁定已修课、锁定学期超出规划期限、互认组含不存在课程/重复归组/少于两门、负席位上限等 |
+| `COURSE_MISSING` | 422 | 课程缺失：目标、锁定或限额课程不在当前目录版本中 |
 | `REQUIREMENT_CONFLICT` | 422 | 条件冲突：先修循环、同修课无共同开课学期、同修课不在目录、锁定与开课季节/同修/不可排课约束冲突等 |
-| `NO_SOLUTION` | 422 | 无解：期限内无法排完（锁定安排、不可排课学期、学分上限/开课季节/先修顺序限制，含全部互认替代均不可行） |
+| `NO_SOLUTION` | 422 | 无解：期限内无法排完（锁定安排、不可排课学期、学分上限/开课季节/先修顺序/课程席位余量限制，含全部互认替代均不可行） |
 | `TOO_COMPLEX` | 422 | 组合或搜索超出内置复杂度上限 |
 | `CATALOG_CHANGED` | 409 | 确认（或重排落库）时目录已修订，拒绝且不写入 |
 | `PLAN_NOT_CONFIRMED` | 409 | 对未确认方案发起滚动重排 |
 | `COMPLETED_REVOKED` | 422 | 累计已修撤销了原方案创建时声明的已修课程 |
-| `NOT_FOUND` | 404 | 方案或目录版本不存在 |
+| `CAPACITY_BELOW_OCCUPIED` | 409 | 设置的席位上限低于该课程该学期已占用席位 |
+| `CAPACITY_FULL` | 409 | 确认时席位余量不足，拒绝确认，原方案与原占位保持不变 |
+| `REPLAN_EXPIRED` | 409 | 重排草案已过期：同一来源方案已有生效的重排结果 |
+| `NOT_FOUND` | 404 | 方案、目录版本或限额设置不存在 |
 
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与错误处理
-  planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课约束、回溯排课、字典序选优）
-  replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异）
-  schemas.py    # 请求模型与校验（含互认组校验）
-  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案）
+  main.py       # FastAPI 路由与错误处理（含席位容量设置/查询、确认时原子复核占位）
+  planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课约束、席位余量、回溯排课、字典序选优）
+  replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异、按当时余量排课）
+  schemas.py    # 请求模型与校验（含互认组、席位上限校验）
+  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位限额与占位）
   seed_data.py  # 种子课程目录（版本 1）
-tests/          # pytest 单元与 API 集成测试（含课程互认组测试）
+tests/          # pytest 单元与 API 集成测试（含课程互认组、席位容量测试）
 examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例
 Dockerfile / docker-compose.yml
 ```
