@@ -55,10 +55,12 @@ def remaining_diff(original_result, new_result, elapsed_semesters):
 
 
 def replan_plan(catalog, original_request, original_result, elapsed_semesters, completed,
-                equiv_groups=None):
+                equiv_groups=None, seat_caps=None, occupied=None):
     """执行滚动重排，返回 (effective_request, result, diff)；失败抛出 PlanError。
 
     equiv_groups 为重排所使用目录版本声明的课程互认组（按当前目录判断互认）。
+    seat_caps/occupied 为席位上限与重排时点的占用余量（调用方应已剔除来源方案
+    尚未结束学期的自身占位，那些占位确认时将被新课表替换）。
     """
     if elapsed_semesters >= int(original_request["num_semesters"]):
         raise PlanError(
@@ -92,6 +94,8 @@ def replan_plan(catalog, original_request, original_result, elapsed_semesters, c
         max_credits=int(original_request["max_credits_per_semester"]),
         num_semesters=remaining,
         equiv_groups=equiv_groups,
+        seat_caps=seat_caps,
+        occupied=occupied,
     )
     diff = remaining_diff(original_result, result, elapsed_semesters)
     return effective_request, result, diff

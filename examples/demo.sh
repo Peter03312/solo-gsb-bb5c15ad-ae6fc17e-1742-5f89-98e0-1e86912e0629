@@ -249,3 +249,50 @@ curl -s "$BASE/catalog/current" | python3 -c "import sys,json;d=json.load(sys.st
 
 step "35. 回看：历史目录版本保持原语义（版本 1 无互认组）"
 curl -s "$BASE/catalog/versions/1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['version_id'], d['equivalence_groups'])"
+
+step "36. 席位上限：设置 CS303@2028-SPRING 上限 1 并查询（上限/已占用/余量；用新学期避免与前序方案重叠）"
+curl -s -X PUT "$BASE/seat-caps/CS303/2028-SPRING" -H 'Content-Type: application/json' -d '{"cap": 1}'; echo
+curl -s "$BASE/seat-caps/CS303/2028-SPRING"; echo
+
+step "37. 席位设置拒绝：非法学期（400）/ 未知课程（422）/ 负上限（422）"
+curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/seat-caps/CS303/2026春" \
+  -H 'Content-Type: application/json' -d '{"cap": 1}'
+curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/seat-caps/NOPE101/2026-SPRING" \
+  -H 'Content-Type: application/json' -d '{"cap": 1}'
+curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/seat-caps/CS303/2028-SPRING" \
+  -H 'Content-Type: application/json' -d '{"cap": -1}'
+
+step "38. 未设置即不限额（cap/remaining 为 null）"
+curl -s "$BASE/seat-caps/CS401/2027-FALL"; echo
+
+step "39. 余量规划：CS303（仅 SPRING 开课）2028/2029 春季名额封死 -> NO_SOLUTION 且不保存"
+curl -s -X PUT "$BASE/seat-caps/CS303/2028-SPRING" -H 'Content-Type: application/json' -d '{"cap": 0}' >/dev/null
+curl -s -X PUT "$BASE/seat-caps/CS303/2029-SPRING" -H 'Content-Type: application/json' -d '{"cap": 0}' >/dev/null
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201"], "target_courses": ["CS303"],
+  "start_semester": "2028-SPRING", "max_credits_per_semester": 12, "num_semesters": 2
+}'
+
+step "40. 超卖防护：放开 2028-SPRING 名额为 1，两个方案竞争，后确认者 409 SEAT_CONFLICT"
+curl -s -X PUT "$BASE/seat-caps/CS303/2028-SPRING" -H 'Content-Type: application/json' -d '{"cap": 1}' >/dev/null
+P_X=$(curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201"], "target_courses": ["CS303"],
+  "start_semester": "2028-SPRING", "max_credits_per_semester": 12, "num_semesters": 2
+}')
+P_X_ID=$(echo "$P_X" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+P_Y=$(curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201"], "target_courses": ["CS303"],
+  "start_semester": "2028-SPRING", "max_credits_per_semester": 12, "num_semesters": 2
+}')
+P_Y_ID=$(echo "$P_Y" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+curl -s -X POST "$BASE/plans/$P_X_ID/confirm" | python3 -c 'import sys,json;print("方案 X:", json.load(sys.stdin)["status"])'
+echo "查询余量："; curl -s "$BASE/seat-caps/CS303/2028-SPRING"; echo
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$P_Y_ID/confirm"
+echo "方案 Y 状态（仍 proposed，席位未超卖）："
+curl -s "$BASE/plans/$P_Y_ID" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])'
+
+step "41. 上限低于已占用拒绝（409 CAP_BELOW_OCCUPIED，原上限不变）"
+curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/seat-caps/CS303/2028-SPRING" \
+  -H 'Content-Type: application/json' -d '{"cap": 0}'
+echo "上限查询（仍为 1）："; curl -s "$BASE/seat-caps/CS303/2028-SPRING"; echo
+echo done

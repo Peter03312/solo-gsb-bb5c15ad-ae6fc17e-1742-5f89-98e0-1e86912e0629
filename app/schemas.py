@@ -120,6 +120,12 @@ class PlanIn(BaseModel):
         return codes
 
 
+class SeatCapIn(BaseModel):
+    """按课程代码与学期设置席位上限；非负整数，未设置即不限额。"""
+
+    cap: int = Field(ge=0, description="非负席位上限；0 表示该学期已不可再占")
+
+
 class ReplanIn(BaseModel):
     """方案执行中途的滚动重排输入。
 
